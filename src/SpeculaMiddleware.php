@@ -42,20 +42,21 @@ class SpeculaMiddleware
         $response   = $next($request);
         $durationMs = (int) ((microtime(true) - $startedAt) * 1000);
 
-        // Only capture JSON responses — skip file downloads, redirects, HTML
-        if (!$this->isJsonResponse($response)) {
+        // Only capture API responses — skip redirects and HTML pages
+        if (!$this->isApiResponse($response)) {
             return $response;
         }
 
         $this->sendObservation([
-            'method'       => $request->method(),
-            'rawPath'      => '/' . $request->path(),
-            'queryParams'  => $this->sanitizeQueryParams($request->query()),
-            'requestBody'  => $this->captureRequestBody($request),
-            'statusCode'   => $response->getStatusCode(),
-            'responseBody' => $this->captureResponseBody($response),
-            'contentType'  => $request->header('Content-Type', ''),
-            'durationMs'   => $durationMs,
+            'method'          => $request->method(),
+            'rawPath'         => $this->routePath($request),
+            'queryParams'     => $this->sanitizeQueryParams($request->query()),
+            'requestBody'     => $this->captureRequestBody($request),
+            'statusCode'      => $response->getStatusCode(),
+            'responseBody'    => $this->captureResponseBody($response),
+            'responseHeaders' => $this->captureResponseHeaders($response),
+            'contentType'     => $request->header('Content-Type', ''),
+            'durationMs'      => $durationMs,
         ]);
 
         return $response;
@@ -132,10 +133,56 @@ class SpeculaMiddleware
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    private function isJsonResponse(SymfonyResponse $response): bool
+    /**
+     * Returns the route template with real parameter names, e.g. /users/{id}/posts/{postId}.
+     * Falls back to the actual request path if no route is matched.
+     */
+    private function routePath(Request $request): string
     {
+        $route = $request->route();
+        if ($route) {
+            // $route->uri() returns e.g. "v1/user/auth/login/auto/{id}/{hash}"
+            return '/' . $route->uri();
+        }
+        return '/' . $request->path();
+    }
+
+    private function captureResponseHeaders(SymfonyResponse $response): array
+    {
+        $headers = [];
+        // Capture Location for redirects — documents where the endpoint redirects to
+        $location = $response->headers->get('Location');
+        if ($location !== null) {
+            $headers['Location'] = $location;
+        }
+        return $headers;
+    }
+
+    private function isApiResponse(SymfonyResponse $response): bool
+    {
+        $status = $response->getStatusCode();
+
         $ct = $response->headers->get('Content-Type', '');
-        return str_contains($ct, 'application/json') || str_contains($ct, 'application/vnd.api+json');
+
+        // Skip HTML — definitely not an API endpoint
+        if (str_contains($ct, 'text/html')) {
+            return false;
+        }
+
+        // Explicit JSON content-type
+        if (str_contains($ct, 'application/json') || str_contains($ct, 'application/vnd.api+json')) {
+            return true;
+        }
+
+        // Sniff body shape — some apps forget to set Content-Type
+        $body = $response->getContent();
+        if (!empty($body)) {
+            $first = ltrim($body)[0] ?? '';
+            return $first === '{' || $first === '[';
+        }
+
+        // No body (e.g. 201 Created, 204 No Content) — still a valid API endpoint
+        return true;
     }
 
     private function isWebhook(Request $request): bool
